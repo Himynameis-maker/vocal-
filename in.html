@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ボーカル抽出（ブラウザ内で完結）</title>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.min.js"></script>
+<style>
+  :root { --bg:#f7f7f5; --fg:#1d1f24; --muted:#666b74; --card:#ffffff; --line:#d9dbe0; --accent:#2f5d8a; --ok:#2a7d4f; --err:#b3372f; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#16181c; --fg:#e6e8eb; --muted:#9aa0aa; --card:#1f2228; --line:#363a42; --accent:#6aa3d8; --ok:#5cbf8a; --err:#e5706a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font-family: system-ui, "Hiragino Sans", "Yu Gothic", sans-serif; line-height:1.7; }
+  main { max-width: 680px; margin: 0 auto; padding: 2rem 1rem 4rem; }
+  h1 { font-size: 1.5rem; margin: 0 0 .3rem; }
+  h2 { font-size: 1.05rem; margin: 0 0 .6rem; }
+  .lead { color: var(--muted); margin: 0 0 1.5rem; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 1.1rem 1.2rem; margin-bottom: 1rem; }
+  .row { margin: .6rem 0; }
+  .row label { display:block; font-weight:600; font-size:.95rem; }
+  .status { font-size:.88rem; color: var(--muted); }
+  .status.ok { color: var(--ok); }
+  input[type=file] { margin-top:.25rem; max-width:100%; }
+  button { font: inherit; padding:.65rem 1.5rem; border-radius:6px; border:1px solid var(--accent); background: var(--accent); color:#fff; cursor:pointer; }
+  button:disabled { opacity:.45; cursor:default; }
+  progress { width:100%; height:10px; margin-top:.8rem; }
+  #log { font-size:.88rem; color:var(--muted); white-space:pre-wrap; margin-top:.5rem; }
+  #log.err { color: var(--err); }
+  .result { margin-top:1rem; }
+  .result audio { width:100%; margin:.3rem 0; }
+  .result a { font-size:.92rem; color: var(--accent); }
+  small { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>ボーカル抽出</h1>
+  <p class="lead">曲をボーカルと伴奏に分けます。処理はすべてこのブラウザの中で行われ、音声は外部に送信されません。</p>
+
+  <section>
+    <h2>1. モデルファイル</h2>
+    <small>Spleeter 2stems のONNXファイルを選びます。一度選べばこのブラウザに保存され、次回からは不要です。</small>
+    <div class="row">
+      <label for="mv">ボーカル用（vocals.onnx）</label>
+      <input type="file" id="mv" accept=".onnx">
+      <div class="status" id="sv">未選択</div>
+    </div>
+    <div class="row">
+      <label for="ma">伴奏用（accompaniment.onnx）</label>
+      <input type="file" id="ma" accept=".onnx">
+      <div class="status" id="sa">未選択</div>
+    </div>
+  </section>
+
+  <section>
+    <h2>2. 曲ファイル</h2>
+    <input type="file" id="audio" accept="audio/*,.mp3,.wav,.m4a,.flac,.ogg">
+    <div class="status" id="sf">未選択</div>
+  </section>
+
+  <section>
+    <h2>3. 分離する</h2>
+    <button id="run" disabled>分離を開始</button>
+    <progress id="bar" value="0" max="1" hidden></progress>
+    <div id="log"></div>
+    <div class="result" id="result"></div>
+  </section>
+</main>
+
+<script>
+'use strict';
+// ---------- 定数（Spleeter 2stems） ----------
+const SR = 44100, N = 4096, H = 1024, BINS = 2049, FB = 1024, T = 512, PAD = N - H;
+const CHUNK_FRAMES = 2048;           // 一度にモデルへ渡すフレーム数（= 4 分割）
+const $ = (id) => document.getElementById(id);
+
+// ---------- モデルの保存（IndexedDB。使えない環境では毎回選択） ----------
+function idb() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open('spleeter-models', 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('m');
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function cacheGet(key) {
+  try {
+    const db = await idb();
+    return await new Promise((res, rej) => {
+      const q = db.transaction('m').objectStore('m').get(key);
+      q.onsuccess = () => res(q.result || null);
+      q.onerror = () => rej(q.error);
+    });
+  } catch (e) { return null; }
+}
+async function cachePut(key, buf) {
+  try {
+    const db = await idb();
+    await new Promise((res, rej) => {
+      const tx = db.transaction('m', 'readwrite');
+      tx.objectStore('m').put(buf, key);
+      tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+    });
+    return true;
+  } catch (e) { return false; }
+}
+
+const models = { vocals: null, acc: null };
+let audioFile = null;
+
+function refresh() {
+  $('run').disabled = !(models.vocals && models.acc && audioFile);
+}
+function setStatus(id, text, ok) {
+  const el = $(id); el.textContent = text; el.className = 'status' + (ok ? ' ok' : '');
+}
+
+async function pickModel(inputId, statusId, key) {
+  const f = $(inputId).files[0];
+  if (!f) return;
+  const buf = await f.arrayBuffer();
+  models[key] = buf;
+  const saved = await cachePut(key, buf);
+  setStatus(statusId, f.name + '（' + (buf.byteLength / 1048576).toFixed(1) + ' MB）' + (saved ? ' 保存しました' : ' ※保存できませんでした。次回も選択が必要です'), true);
+  refresh();
+}
+$('mv').addEventListener('change', () => pickModel('mv', 'sv', 'vocals'));
+$('ma').addEventListener('change', () => pickModel('ma', 'sa', 'acc'));
+
+$('audio').addEventListener('change', () => {
+  audioFile = $('audio').files[0] || null;
+  setStatus('sf', audioFile ? audioFile.name : '未選択', !!audioFile);
+  refresh();
+});
+
+(async () => {
+  for (const [key, sid] of [['vocals', 'sv'], ['acc', 'sa']]) {
+    const b = await cacheGet(key);
+    if (b) { models[key] = b; setStatus(sid, '保存済みのモデルを使います（変更する場合は選び直してください）', true); }
+  }
+  refresh();
+})();
+
+// ---------- FFT（基数2、サイズ N） ----------
+const win = new Float32Array(N);
+for (let i = 0; i < N; i++) win[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / N);   // 周期ハン窓
+const cosT = new Float64Array(N / 2), sinT = new Float64Array(N / 2);
+for (let i = 0; i < N / 2; i++) { cosT[i] = Math.cos(2 * Math.PI * i / N); sinT[i] = Math.sin(2 * Math.PI * i / N); }
+const rev = new Uint16Array(N);
+for (let i = 0, bits = Math.log2(N); i < N; i++) {
+  let r = 0; for (let b = 0; b < bits; b++) if (i & (1 << b)) r |= 1 << (bits - 1 - b);
+  rev[i] = r;
+}
+function fft(re, im) {
+  for (let i = 0; i < N; i++) {
+    const j = rev[i];
+    if (j > i) { let t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+  }
+  for (let size = 2; size <= N; size <<= 1) {
+    const half = size >> 1, step = N / size;
+    for (let i = 0; i < N; i += size) {
+      for (let j = 0, k = 0; j < half; j++, k += step) {
+        const wr = cosT[k], wi = -sinT[k];
+        const a = i + j, b = a + half;
+        const xr = re[b] * wr - im[b] * wi;
+        const xi = re[b] * wi + im[b] * wr;
+        re[b] = re[a] - xr; im[b] = im[a] - xi;
+        re[a] += xr; im[a] += xi;
+      }
+    }
+  }
+}
+// 片側スペクトル（BINS 個）→ 時間波形（窓掛けして加算）
+const wr_ = new Float64Array(N), wi_ = new Float64Array(N);
+function ifftAdd(sre, sim, out, offset) {
+  for (let k = 0; k < BINS; k++) { wr_[k] = sre[k]; wi_[k] = -sim[k]; }
+  wi_[0] = 0; wi_[BINS - 1] = 0;
+  for (let k = 1; k < BINS - 1; k++) { wr_[N - k] = sre[k]; wi_[N - k] = sim[k]; }
+  fft(wr_, wi_);
+  for (let i = 0; i < N; i++) out[offset + i] += (wr_[i] / N) * win[i];
+}
+
+// ---------- WAV 書き出し ----------
+function toWav(l, r) {
+  const n = l.length, buf = new ArrayBuffer(44 + n * 4), v = new DataView(buf);
+  const s = (o, t) => { for (let i = 0; i < t.length; i++) v.setUint8(o + i, t.charCodeAt(i)); };
+  s(0, 'RIFF'); v.setUint32(4, 36 + n * 4, true); s(8, 'WAVEfmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 2, true);
+  v.setUint32(24, SR, true); v.setUint32(28, SR * 4, true); v.setUint16(32, 4, true); v.setUint16(34, 16, true);
+  s(36, 'data'); v.setUint32(40, n * 4, true);
+  let o = 44;
+  for (let i = 0; i < n; i++) {
+    for (const ch of [l, r]) {
+      const x = Math.max(-1, Math.min(1, ch[i]));
+      v.setInt16(o, x < 0 ? x * 32768 : x * 32767, true); o += 2;
+    }
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+// ---------- 分離本体 ----------
+const log = (t, err) => { $('log').textContent = t; $('log').className = err ? 'err' : ''; };
+const tick = () => new Promise((r) => setTimeout(r, 0));
+
+async function separate(ch, sessV, sessA, onProgress) {
+  const len = ch[0].length;
+  const F = Math.floor((PAD + len - 1) / H) + 1;       // 合成するフレーム数
+  const Lp = H * (F - 1) + N;
+  const padded = ch.map((c) => { const p = new Float32Array(Lp); p.set(c, PAD); return p; });
+  const outV = [new Float32Array(Lp), new Float32Array(Lp)];
+  const outA = [new Float32Array(Lp), new Float32Array(Lp)];
+  const env = new Float32Array(Lp);
+  for (let f = 0; f < F; f++) for (let i = 0; i < N; i++) env[f * H + i] += win[i] * win[i];
+
+  const re = new Float64Array(N), im = new Float64Array(N);
+  const vre = new Float32Array(BINS), vim = new Float32Array(BINS);
+  const are = new Float32Array(BINS), aim = new Float32Array(BINS);
+
+  for (let f0 = 0; f0 < F; f0 += CHUNK_FRAMES) {
+    const nf = Math.min(CHUNK_FRAMES, F - f0);
+    const k = Math.ceil(nf / T);
+    const specRe = [new Float32Array(nf * BINS), new Float32Array(nf * BINS)];
+    const specIm = [new Float32Array(nf * BINS), new Float32Array(nf * BINS)];
+    const x = new Float32Array(2 * k * T * FB);
+    const base = (c, fi) => ((c * k + (fi >> 9)) * T + (fi & (T - 1))) * FB;
+
+    for (let c = 0; c < 2; c++) {
+      for (let fi = 0; fi < nf; fi++) {
+        const st = (f0 + fi) * H;
+        for (let i = 0; i < N; i++) { re[i] = padded[c][st + i] * win[i]; im[i] = 0; }
+        fft(re, im);
+        const o = fi * BINS, xb = base(c, fi);
+        for (let b = 0; b < BINS; b++) { specRe[c][o + b] = re[b]; specIm[c][o + b] = im[b]; }
+        for (let b = 0; b < FB; b++) x[xb + b] = Math.hypot(re[b], im[b]);
+      }
+    }
+
+    const feeds = () => ({ x: new ort.Tensor('float32', x, [2, k, T, FB]) });
+    const yv = (await sessV.run(feeds())).y.data;
+    await tick();
+    const ya = (await sessA.run(feeds())).y.data;
+
+    for (let c = 0; c < 2; c++) {
+      for (let fi = 0; fi < nf; fi++) {
+        const o = fi * BINS, xb = base(c, fi);
+        for (let b = 0; b < FB; b++) {
+          const v = yv[xb + b], a = ya[xb + b];
+          const v2 = v * v, a2 = a * a, den = v2 + a2 + 1e-10;
+          const mv = v2 / den, ma = a2 / den;
+          vre[b] = mv * specRe[c][o + b]; vim[b] = mv * specIm[c][o + b];
+          are[b] = ma * specRe[c][o + b]; aim[b] = ma * specIm[c][o + b];
+        }
+        // モデルが扱わない高域（約11kHz以上）: ボーカルには含めず、伴奏にそのまま残す
+        for (let b = FB; b < BINS; b++) {
+          vre[b] = 0; vim[b] = 0;
+          are[b] = specRe[c][o + b]; aim[b] = specIm[c][o + b];
+        }
+        const st = (f0 + fi) * H;
+        ifftAdd(vre, vim, outV[c], st);
+        ifftAdd(are, aim, outA[c], st);
+      }
+    }
+    onProgress(Math.min(1, (f0 + nf) / F));
+    await tick();
+  }
+
+  const finish = (arr) => arr.map((a) => {
+    const o = new Float32Array(len);
+    for (let i = 0; i < len; i++) { const e = env[PAD + i]; o[i] = e > 1e-6 ? a[PAD + i] / e : 0; }
+    return o;
+  });
+  return { vocals: finish(outV), acc: finish(outA) };
+}
+
+$('run').addEventListener('click', async () => {
+  const btn = $('run'), bar = $('bar');
+  btn.disabled = true; bar.hidden = false; bar.value = 0; $('result').innerHTML = '';
+  const t0 = performance.now();
+  try {
+    if (typeof ort === 'undefined') throw new Error('onnxruntime-webを読み込めませんでした。ネット接続を確認してください。');
+    ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
+
+    log('曲を読み込んでいます…');
+    const ac = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SR });
+    const decoded = await ac.decodeAudioData(await audioFile.arrayBuffer());
+    const L = decoded.getChannelData(0).slice();
+    const R = (decoded.numberOfChannels > 1 ? decoded.getChannelData(1) : decoded.getChannelData(0)).slice();
+    ac.close();
+    const secs = L.length / SR;
+
+    log('モデルを読み込んでいます…');
+    await tick();
+    const opts = { executionProviders: ['wasm'] };
+    const sessV = await ort.InferenceSession.create(new Uint8Array(models.vocals.slice(0)), opts);
+    const sessA = await ort.InferenceSession.create(new Uint8Array(models.acc.slice(0)), opts);
+
+    log('分離しています…（' + Math.round(secs) + '秒の曲。時間がかかります。このタブを開いたままにしてください）');
+    const res = await separate([L, R], sessV, sessA, (p) => { bar.value = p; });
+
+    const stem = audioFile.name.replace(/\.[^.]+$/, '');
+    const add = (title, name, ch) => {
+      const url = URL.createObjectURL(toWav(ch[0], ch[1]));
+      const d = document.createElement('div');
+      d.innerHTML = '<strong></strong><audio controls></audio><a download></a>';
+      d.querySelector('strong').textContent = title;
+      d.querySelector('audio').src = url;
+      const a = d.querySelector('a'); a.href = url; a.download = stem + '_' + name + '.wav'; a.textContent = 'WAVを保存';
+      d.style.marginBottom = '1rem';
+      $('result').appendChild(d);
+    };
+    add('ボーカル', 'vocals', res.vocals);
+    add('伴奏（カラオケ）', 'instrumental', res.acc);
+    log('完了（' + ((performance.now() - t0) / 1000).toFixed(0) + '秒）');
+  } catch (e) {
+    log('エラー: ' + (e && e.message ? e.message : e), true);
+  }
+  btn.disabled = false; bar.hidden = true; refresh();
+});
+</script>
+</body>
+</html>
